@@ -13,7 +13,16 @@ import pandas as pd
 import streamlit as st
 
 from ytrend import ai, storage
-from ytrend.ai_finder import AI_VERDICTS_SHOWN, KEYWORD_PACKS, discover, summarize_niches, verify_with_claude
+from ytrend.ai_finder import (
+    AI_VERDICTS_SHOWN,
+    DURATIONS,
+    KEYWORD_PACKS,
+    discover,
+    scan_channels,
+    seed_queries,
+    summarize_niches,
+    verify_with_claude,
+)
 from ytrend.channel import analyze_channel, combine_analyses
 from ytrend.frames import analyze_video_file
 from ytrend.master_prompt import collect_images, generate_template, refine, start_conversation
@@ -123,6 +132,8 @@ with tab_tr:
                               help="The trending chart is dominated by trailers, music videos and big gamers.")
     min_vph = f2.number_input("Min views/hour", 0, 10_000_000, 0, step=1000)
 
+    st.caption("Note: YouTube's trending chart ranks the day's biggest videos and barely includes Shorts. "
+               "For AI Shorts use tab ② 🤖 AI video finder.")
     if st.button("Find trending", type="primary", disabled=not regions):
         yt = yt_client()
         if yt:
@@ -238,96 +249,172 @@ with tab_tr:
 # ============================================================================= ② AI video finder
 VERDICT_BADGE = {"ai_generated": "🤖 AI", "likely_ai": "🤖 likely AI", "unclear": "❔ unclear", "not_ai": "🎥 not AI"}
 
+
+def render_ai_results(found: list[dict], funnel: dict | None, context_label: str) -> None:
+    if funnel:
+        st.caption("How results were narrowed: " + " → ".join(f"{k}: **{v}**" for k, v in funnel.items()))
+    if not found:
+        st.info("Nothing left after the filters — lower 'Min views/hour', allow more days, or add keywords. "
+                "The counts above show which step removed the videos.")
+        return
+    # Without Claude most AI videos can't be recognised from metadata, so show "unclear" too.
+    show_unclear = st.toggle("Include videos marked ❔ unclear", value=not any(r.get("ai_checked") for r in found),
+                             key=f"unclear_{context_label}",
+                             help="Many AI channels never write 'AI' in titles; without Claude's thumbnail "
+                                  "check they are marked unclear.")
+    show_not = st.toggle("Include videos judged 🎥 not AI", value=False, key=f"notai_{context_label}")
+    allowed = set(AI_VERDICTS_SHOWN) | ({"unclear"} if show_unclear else set()) | ({"not_ai"} if show_not else set())
+    shown = [r for r in found if r["ai_verdict"] in allowed]
+
+    ai_rows = [r for r in found if r["ai_verdict"] in AI_VERDICTS_SHOWN]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Videos", len(found))
+    m2.metric("AI / likely AI", len(ai_rows))
+    m3.metric("Shorts", sum(r["format"] == "short" for r in found))
+    m4.metric("Median VPH (shown)", f"{int(pd.Series([r['views_per_hour'] for r in shown]).median()):,}" if shown else "—")
+
+    niches = summarize_niches(found, include_unclear=show_unclear)
+    if niches:
+        st.subheader("Niches ranked by median views/hour")
+        st.dataframe(pd.DataFrame(niches), width="stretch", hide_index=True,
+                     column_config={"best_url": st.column_config.LinkColumn("best video link"),
+                                    "median_vph": st.column_config.NumberColumn("median VPH", format="%d"),
+                                    "best_vph": st.column_config.NumberColumn("best VPH", format="%d"),
+                                    "shorts_pct": st.column_config.NumberColumn("% Shorts", format="%d%%")})
+        ss.trending_lang = {"source": f"AI video finder ({context_label})", "ai_niches_by_vph": niches[:12]}
+        st.caption("This table is passed to the master prompt as trending context.")
+
+    watched = {w["channel_id"] for w in storage.watch_list()}
+    st.subheader(f"Videos ({len(shown)})")
+    for r in shown[:60]:
+        a, b, c = st.columns([1, 4, 1])
+        if r["thumbnail"]:
+            a.image(r["thumbnail"])
+        subs = f"{r['subscribers']:,} subs" if r.get("subscribers") is not None else "subs hidden"
+        b.markdown(
+            f"**[{r['title']}]({r['url']})**  \n{r['channel']} · {subs} · "
+            f"**{r['views_per_hour']:,} views/h** · {r['views']:,} views · "
+            f"{r['format']} {fmt_seconds(r['duration_s'])} · {language_name(r['language'])}  \n"
+            f"{VERDICT_BADGE[r['ai_verdict']]} ({r['ai_confidence']}%)"
+            + (f" · _{r['ai_niche']}_" if r.get("ai_niche") else "")
+            + f" — {r['ai_reason']}"
+        )
+        if c.button("Add →", key=f"ai_{context_label}_{r['video_id']}", help="Add channel to the analysis list"):
+            add_to_analysis(r["channel_id"], r["channel"])
+        if r["channel_id"] not in watched and c.button("⭐ Watch", key=f"w_{context_label}_{r['video_id']}"):
+            storage.watch_add(r["channel_id"], r["channel"])
+            st.toast(f"{r['channel']} added to your watchlist")
+
+
 with tab_ai:
-    st.markdown("Finds **AI-generated videos getting strong views per hour right now** by searching recent "
-                "uploads with AI-video keywords (they rarely reach YouTube's trending chart).")
-    packs = st.multiselect("Keyword packs", list(KEYWORD_PACKS),
-                           default=["General AI video", "AI stories (Hindi / Indian)", "AI Shorts: animals & babies"])
-    custom = st.text_input("Extra keywords (comma separated)", placeholder="e.g. ai bhakti, ai cricket, ai mahabharat")
-    queries = list(dict.fromkeys([q for p in packs for q in KEYWORD_PACKS[p]] +
-                                 [q.strip() for q in custom.split(",") if q.strip()]))
-    with st.expander(f"Search queries ({len(queries)})"):
-        st.write(", ".join(queries) or "—")
+    st.markdown("Finds **AI-generated videos (mostly Shorts) with strong views per hour**. YouTube's trending "
+                "chart barely includes Shorts, so AI channels rarely show up in tab ①.")
+    if not ai.available():
+        st.warning("No Anthropic key: videos can only be recognised as AI from YouTube's AI label or AI words in the "
+                   "title/tags. Most AI channels don't write 'AI', so they show as ❔ unclear. Add a key in the "
+                   "sidebar for Claude's thumbnail check.")
+    mode = st.radio("How to search", ["🔎 Keyword search", "🌱 Similar to channels I like", "⭐ My watchlist"],
+                    horizontal=True)
 
     c1, c2, c3, c4 = st.columns(4)
     a_region = c1.selectbox("Region", ["Any"] + list(REGIONS), index=1 + list(REGIONS).index("India"), key="a_region")
-    a_lang = c2.selectbox("Language", ["Any"] + LANG_CHOICES, key="a_lang")
-    a_days = c3.slider("Uploaded in the last N days", 1, 14, 3, key="a_days")
-    a_fmt = c4.selectbox("Format", ["Any", "Shorts (< 4 min)", "Medium (4-20 min)", "Long (> 20 min)"])
+    a_lang = c2.selectbox("Language", ["Any"] + LANG_CHOICES, key="a_lang",
+                          help="Only a hint to YouTube search — results in other languages still appear.")
+    a_days = c3.slider("Uploaded in the last N days", 1, 14, 3 if mode != "⭐ My watchlist" else 7, key="a_days")
+    a_fmt = c4.selectbox("Format", list(DURATIONS), key="a_fmt")
     c5, c6, c7 = st.columns(3)
-    a_min_vph = c5.number_input("Min views/hour", 0, 10_000_000, 500, step=500)
+    a_min_vph = c5.number_input("Min views/hour", 0, 10_000_000, 200, step=100)
     a_max_subs = c6.select_slider("Max channel subscribers", ["No limit", 10_000, 50_000, 100_000, 500_000, 1_000_000],
                                   value="No limit", format_func=lambda n: n if isinstance(n, str) else f"{n:,}")
     a_pages = c7.number_input("Pages per query (50 videos each)", 1, 3, 1)
-    v1, v2 = st.columns(2)
-    a_verify = v1.checkbox("Verify with Claude (looks at thumbnails)", value=ai.available(), disabled=not ai.available(),
-                           help="Without Claude, videos are judged only by YouTube's AI disclosure and AI words in the metadata.")
+    v1, v2, v3 = st.columns(3)
+    a_verify = v1.checkbox("Verify with Claude (thumbnails)", value=ai.available(), disabled=not ai.available())
     a_thumbs = v2.checkbox("Include thumbnails in the check", value=True, disabled=not a_verify)
-    cost = len(queries) * int(a_pages) * 100
-    st.caption(f"Estimated YouTube quota: up to {cost:,} units (cached for 6 h; you have "
-               f"{max(DAILY_QUOTA - storage.quota_used_today(), 0):,} left today).")
+    a_no_tut = v3.checkbox("Remove tutorials / 'kaise banaye' videos", value=True)
 
-    if st.button("Find AI videos", type="primary", disabled=not queries):
+    region_code = None if a_region == "Any" else REGIONS[a_region]
+    lang_code = NAME_TO_CODE.get(a_lang) if a_lang != "Any" else None
+    max_subs = None if a_max_subs == "No limit" else a_max_subs
+
+    def _verify(found: list[dict]) -> None:
+        if found and a_verify:
+            with st.spinner(f"Claude is checking {min(len(found), 120)} videos for AI content…"):
+                verify_with_claude(found, use_thumbnails=a_thumbs)
+
+    def _run(label: str, fn) -> None:
         yt = yt_client()
-        if yt:
-            try:
-                prog = st.progress(0.0, text="Searching…")
-                dur = {"Shorts (< 4 min)": "short", "Medium (4-20 min)": "medium", "Long (> 20 min)": "long"}.get(a_fmt)
-                found = discover(yt, queries, None if a_region == "Any" else REGIONS[a_region],
-                                 NAME_TO_CODE.get(a_lang) if a_lang != "Any" else None, days=a_days, duration=dur,
-                                 pages=int(a_pages), max_subscribers=None if a_max_subs == "No limit" else a_max_subs,
-                                 progress=lambda f: prog.progress(f, text="Searching…"))
-                found = [r for r in found if r["views_per_hour"] >= a_min_vph]
-                if found and a_verify:
-                    with st.spinner(f"Claude is checking {min(len(found), 120)} videos for AI content…"):
-                        verify_with_claude(found, use_thumbnails=a_thumbs)
-                ss.ai_found = found
-                storage.history_save("ai_finder", f"AI finder {a_region}/{a_lang}/{a_days}d — {len(found)} videos", found)
-            except YouTubeError as e:
-                st.error(str(e))
-            except Exception as e:
-                claude_error(e)
+        if not yt:
+            return
+        try:
+            prog = st.progress(0.0, text="Searching…")
+            found, funnel = fn(yt, lambda f: prog.progress(f, text="Searching…"))
+            _verify(found)
+            ss.ai_found, ss.ai_funnel, ss.ai_label = found, funnel, label
+            storage.history_save("ai_finder", f"AI finder: {label} — {len(found)} videos", found)
+        except YouTubeError as e:
+            st.error(str(e))
+        except Exception as e:
+            claude_error(e)
 
-    found = ss.get("ai_found")
-    if found is not None:
-        show_all = st.toggle("Also show videos judged not AI / unclear", value=False)
-        shown = found if show_all else [r for r in found if r["ai_verdict"] in AI_VERDICTS_SHOWN]
-        n_ai = sum(r["ai_verdict"] in AI_VERDICTS_SHOWN for r in found)
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Videos found", len(found))
-        m2.metric("AI-generated", n_ai)
-        m3.metric("Median VPH (AI)", f"{int(pd.Series([r['views_per_hour'] for r in found if r['ai_verdict'] in AI_VERDICTS_SHOWN]).median() or 0):,}"
-                  if n_ai else "—")
+    if mode == "🔎 Keyword search":
+        packs = st.multiselect("Keyword packs", list(KEYWORD_PACKS),
+                               default=["AI Shorts (general)", "AI stories (Hindi / Indian)", "AI devotional / mythology"])
+        custom = st.text_input("Extra keywords (comma separated)", placeholder="e.g. #aicricket, ai village life")
+        queries = list(dict.fromkeys([q for p in packs for q in KEYWORD_PACKS[p]] +
+                                     [q.strip() for q in custom.split(",") if q.strip()]))
+        st.caption(f"{len(queries)} queries: {', '.join(queries) or '—'} · up to {len(queries) * int(a_pages) * 100:,} "
+                   f"quota units (cached 6 h; {max(DAILY_QUOTA - storage.quota_used_today(), 0):,} left today)")
+        if st.button("Find AI videos", type="primary", disabled=not queries):
+            _run("keywords", lambda yt, p: discover(
+                yt, queries, region_code, lang_code, days=a_days, duration=DURATIONS[a_fmt], pages=int(a_pages),
+                max_subscribers=max_subs, min_vph=a_min_vph, exclude_tutorials=a_no_tut, progress=p))
 
-        niches = summarize_niches(found)
-        if niches:
-            st.subheader("AI niches ranked by median views/hour")
-            ndf = pd.DataFrame(niches)
-            st.dataframe(ndf, width="stretch", hide_index=True,
-                         column_config={"best_url": st.column_config.LinkColumn("best video link"),
-                                        "median_vph": st.column_config.NumberColumn("median VPH", format="%d"),
-                                        "best_vph": st.column_config.NumberColumn("best VPH", format="%d"),
-                                        "shorts_pct": st.column_config.NumberColumn("% Shorts", format="%d%%")})
-            ss.trending_lang = {"source": "AI video finder", "language_name": a_lang,
-                                "ai_niches_by_vph": niches[:12]}
-            st.caption("This niche table is passed to the master prompt as trending context.")
+    elif mode == "🌱 Similar to channels I like":
+        seeds_text = st.text_area("AI channels you like — one per line (@handle, URL, or any of their video links)",
+                                  height=90, key="seeds")
+        per_seed = st.slider("Search queries per channel", 2, 6, 4,
+                             help="Built from each channel's own hashtags and title words. 100 quota units each.")
+        seeds = [s.strip() for s in seeds_text.splitlines() if s.strip()]
+        if st.button("Find similar AI videos", type="primary", disabled=not seeds):
+            yt = yt_client()
+            if yt:
+                try:
+                    with st.spinner("Reading the seed channels…"):
+                        qs, seed_info = seed_queries(yt, seeds, per_seed)
+                    ss.seed_queries = qs
+                    for s_ in seed_info:
+                        storage.watch_add(s_["channel_id"], s_["channel"])
+                except YouTubeError as e:
+                    st.error(str(e))
+                    qs = []
+                if qs:
+                    _run("similar to " + ", ".join(seeds)[:60], lambda yt_, p: discover(
+                        yt_, qs, region_code, lang_code, days=a_days, duration=DURATIONS[a_fmt],
+                        pages=int(a_pages), max_subscribers=max_subs, min_vph=a_min_vph,
+                        exclude_tutorials=a_no_tut, progress=p))
+        if ss.get("seed_queries"):
+            st.caption("Queries built from your channels: " + ", ".join(ss.seed_queries)
+                       + " · the seed channels were also added to your ⭐ watchlist.")
 
-        st.subheader(f"Videos ({len(shown)})")
-        for r in shown[:60]:
-            a, b, c = st.columns([1, 4, 1])
-            if r["thumbnail"]:
-                a.image(r["thumbnail"])
-            subs = f"{r['subscribers']:,} subs" if r.get("subscribers") is not None else "subs hidden"
-            b.markdown(
-                f"**[{r['title']}]({r['url']})**  \n{r['channel']} · {subs} · "
-                f"**{r['views_per_hour']:,} views/h** · {r['views']:,} views · "
-                f"{r['format']} {fmt_seconds(r['duration_s'])} · {language_name(r['language'])}  \n"
-                f"{VERDICT_BADGE[r['ai_verdict']]} ({r['ai_confidence']}%)"
-                + (f" · _{r['ai_niche']}_" if r.get("ai_niche") else "")
-                + f" — {r['ai_reason']}"
-            )
-            if c.button("Add →", key=f"ai_{r['video_id']}"):
-                add_to_analysis(r["channel_id"], r["channel"])
+    else:
+        wl = storage.watch_list()
+        if not wl:
+            st.info("Your watchlist is empty. Click ⭐ Watch on any result, or use 'Similar to channels I like'.")
+        else:
+            st.caption(f"{len(wl)} channels · about {len(wl) * 3} quota units per check")
+            cols = st.columns(3)
+            for i, w in enumerate(wl):
+                if cols[i % 3].button(f"✖ {w['title']}", key=f"unwatch_{w['channel_id']}", help="Remove from watchlist"):
+                    storage.watch_remove(w["channel_id"])
+                    st.rerun()
+            if st.button("Check watchlist", type="primary"):
+                _run("watchlist", lambda yt, p: scan_channels(
+                    yt, [w["channel_id"] for w in wl], days=a_days, min_vph=a_min_vph, progress=p))
+
+    if ss.get("ai_found") is not None:
+        st.divider()
+        render_ai_results(ss.ai_found, ss.get("ai_funnel"), ss.get("ai_label", "results"))
+
 
 # ============================================================================= ③ breakouts
 with tab_br:

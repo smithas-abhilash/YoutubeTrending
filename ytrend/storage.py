@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, kind TEXT NOT NULL,
     title TEXT NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS watchlist (
+    channel_id TEXT PRIMARY KEY, title TEXT NOT NULL, ts REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_quota_day ON quota_log(day);
 CREATE INDEX IF NOT EXISTS idx_history_kind ON history(kind, ts);
 """
@@ -138,3 +140,20 @@ def history_get(item_id: int) -> Any | None:
 def history_delete(item_id: int) -> None:
     with _conn() as c:
         c.execute("DELETE FROM history WHERE id = ?", (item_id,))
+
+
+# ---------------------------------------------------------------- watchlist
+def watch_add(channel_id: str, title: str) -> None:
+    with _conn() as c:
+        c.execute("INSERT OR IGNORE INTO watchlist VALUES (?, ?, ?)", (channel_id, title, time.time()))
+
+
+def watch_remove(channel_id: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM watchlist WHERE channel_id = ?", (channel_id,))
+
+
+def watch_list() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute("SELECT channel_id, title FROM watchlist ORDER BY ts").fetchall()
+    return [{"channel_id": i, "title": t} for i, t in rows]

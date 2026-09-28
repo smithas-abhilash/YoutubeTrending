@@ -206,7 +206,8 @@ def test_ai_finder(monkeypatch):
     from ytrend import ai_finder
     monkeypatch.setitem(VIDEOS["v2"], "status", {"containsSyntheticMedia": True})
     monkeypatch.setitem(VIDEOS["v3"]["snippet"], "tags", ["sora ai", "veo 3"])
-    found = ai_finder.discover(client(), ["ai story", "ai video"], "IN", "hi", days=3)
+    found, funnel = ai_finder.discover(client(), ["ai story", "ai video"], "IN", "hi", days=3)
+    assert funnel["search results"] == 12 and funnel["unique videos"] == 6
     assert len(found) == 6 and all(r["queries"] == ["ai story", "ai video"] for r in found)
     assert found[0]["views_per_hour"] >= found[-1]["views_per_hour"]
     by_id = {r["video_id"]: r for r in found}
@@ -227,3 +228,24 @@ def test_ai_terms_do_not_match_plain_words():
     from ytrend.ai_finder import metadata_signals
     assert metadata_signals({"title": "Said the captain", "description": "", "tags": []}) == []
     assert metadata_signals({"title": "Kling AI dragon", "description": "", "tags": []})
+
+
+def test_tutorials_seeds_and_watchlist(monkeypatch):
+    from ytrend import ai_finder
+    assert ai_finder.is_tutorial({"title": "AI video kaise banaye free me", "description": ""})
+    assert not ai_finder.is_tutorial({"title": "Hanuman ji ki kahani #aikahani", "description": ""})
+    monkeypatch.setitem(VIDEOS["v4"]["snippet"], "title", "How to make AI videos free")
+    found, funnel = ai_finder.discover(client(), ["ai"], None, None, min_vph=1)
+    assert "v4" not in {r["video_id"] for r in found} and funnel["after removing tutorials"] == 5
+
+    qs, seeds = ai_finder.seed_queries(client(), ["@horror"], per_seed=3)
+    assert seeds[0]["channel_id"] == "UCaaaaaaaaaaaaaaaaaaaaaa"
+    assert "#horror" in qs and len(qs) <= 3
+
+    storage.watch_add("UCaaaaaaaaaaaaaaaaaaaaaa", "Chan A")
+    storage.watch_add("UCaaaaaaaaaaaaaaaaaaaaaa", "Chan A")
+    assert len(storage.watch_list()) == 1
+    rows, funnel = ai_finder.scan_channels(client(), [w["channel_id"] for w in storage.watch_list()], days=7)
+    assert {r["video_id"] for r in rows} == {"v1", "v2"}  # v5/v6 are older than 7 days
+    storage.watch_remove("UCaaaaaaaaaaaaaaaaaaaaaa")
+    assert storage.watch_list() == []
