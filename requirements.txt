@@ -1,5 +1,7 @@
-streamlit>=1.37
+streamlit>=1.46
 pandas>=2.0
 requests>=2.31
 anthropic>=0.70
 youtube-transcript-api>=0.6
+opencv-python-headless>=4.8
+tzdata>=2024.1

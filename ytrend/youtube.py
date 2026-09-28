@@ -7,13 +7,22 @@ https://console.cloud.google.com/apis/credentials and enable
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any, Iterable, Iterator
 
 import requests
 
+from . import storage
+
 API_BASE = "https://www.googleapis.com/youtube/v3"
+DAILY_QUOTA = 10_000
+# Quota cost per request (https://developers.google.com/youtube/v3/determine_quota_cost).
+UNIT_COST = {"search": 100}
+# How long cached responses stay fresh, in seconds. Trending moves fast; the rest barely changes.
+CACHE_TTL = {"videos:mostPopular": 3600, "search": 6 * 3600, "commentThreads": 12 * 3600}
+DEFAULT_TTL = 6 * 3600
 
 
 class YouTubeError(RuntimeError):
@@ -21,26 +30,38 @@ class YouTubeError(RuntimeError):
 
 
 class YouTubeClient:
-    def __init__(self, api_key: str | None = None, session: requests.Session | None = None):
+    def __init__(self, api_key: str | None = None, session: requests.Session | None = None,
+                 use_cache: bool = True):
         self.api_key = api_key or os.environ.get("YOUTUBE_API_KEY")
         if not self.api_key:
             raise YouTubeError(
-                "YouTube API key missing. Set YOUTUBE_API_KEY or pass --youtube-key."
+                "YouTube API key missing. Enter it in the sidebar or set YOUTUBE_API_KEY."
             )
         self.session = session or requests.Session()
+        self.use_cache = use_cache
 
     # ------------------------------------------------------------------ low level
     def _get(self, resource: str, **params: Any) -> dict:
         params = {k: v for k, v in params.items() if v is not None}
-        params["key"] = self.api_key
-        resp = self.session.get(f"{API_BASE}/{resource}", params=params, timeout=30)
+        cache_key = resource + "?" + json.dumps(params, sort_keys=True)
+        ttl = CACHE_TTL.get(f"{resource}:{params.get('chart')}", CACHE_TTL.get(resource, DEFAULT_TTL))
+        if self.use_cache:
+            cached = storage.cache_get(cache_key, ttl)
+            if cached is not None:
+                return cached
+
+        resp = self.session.get(f"{API_BASE}/{resource}", params={**params, "key": self.api_key}, timeout=30)
+        storage.quota_add(resource, UNIT_COST.get(resource, 1))
         if resp.status_code != 200:
             try:
                 msg = resp.json()["error"]["message"]
             except Exception:
                 msg = resp.text[:300]
             raise YouTubeError(f"{resource}: HTTP {resp.status_code}: {msg}")
-        return resp.json()
+        body = resp.json()
+        if self.use_cache:
+            storage.cache_put(cache_key, body)
+        return body
 
     def _paged(self, resource: str, limit: int, **params: Any) -> Iterator[dict]:
         fetched = 0
@@ -134,6 +155,20 @@ class YouTubeClient:
             for it in self._paged("playlistItems", limit, part="contentDetails", playlistId=uploads)
         ]
         return self.videos(ids)
+
+    def top_comments(self, video_id: str, limit: int = 100) -> list[dict]:
+        """Most relevant top-level comments of a video (empty if comments are off)."""
+        try:
+            items = list(self._paged("commentThreads", limit, part="snippet", videoId=video_id,
+                                     order="relevance", textFormat="plainText"))
+        except YouTubeError:
+            return []  # comments disabled / members-only
+        out = []
+        for it in items:
+            c = it["snippet"]["topLevelComment"]["snippet"]
+            out.append({"text": c.get("textDisplay", ""), "likes": int(c.get("likeCount", 0)),
+                        "replies": int(it["snippet"].get("totalReplyCount", 0))})
+        return out
 
     def search_videos(
         self,

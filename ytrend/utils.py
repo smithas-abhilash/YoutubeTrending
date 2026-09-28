@@ -34,6 +34,15 @@ def parse_time(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+TIMEZONES = ["Asia/Kolkata", "UTC", "America/New_York", "America/Los_Angeles", "Europe/London",
+             "Asia/Dubai", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney"]
+
+
+def to_local(dt: datetime, tz_name: str) -> datetime:
+    from zoneinfo import ZoneInfo  # Windows needs the `tzdata` package for this
+    return dt.astimezone(ZoneInfo(tz_name))
+
+
 def hours_since(ts: str, now: datetime | None = None) -> float:
     now = now or datetime.now(timezone.utc)
     return max((now - parse_time(ts)).total_seconds() / 3600, 1.0)
@@ -96,12 +105,20 @@ def _script_of(ch: str) -> str | None:
     return None
 
 
-def detect_language(snippet: dict) -> str:
-    """Best-effort language code for a video snippet."""
+def language_from_metadata(snippet: dict) -> str | None:
+    """Language the uploader declared, if any."""
     for key in ("defaultAudioLanguage", "defaultLanguage"):
         lang = snippet.get(key)
         if lang and lang not in ("zxx", "und"):
             return lang.split("-")[0].lower()
+    return None
+
+
+def detect_language(snippet: dict) -> str:
+    """Best-effort language code for a video snippet (metadata first, then script)."""
+    declared = language_from_metadata(snippet)
+    if declared:
+        return declared
     text = f"{snippet.get('title', '')} {snippet.get('description', '')[:300]}"
     counts = Counter(s for s in map(_script_of, text) if s)
     if not counts:

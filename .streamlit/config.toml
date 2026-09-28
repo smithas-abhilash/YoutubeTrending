@@ -1,0 +1,6 @@
+[server]
+# Allow reference video files up to 2 GB in the "Analyse a reference video file" section.
+maxUploadSize = 2048
+
+[browser]
+gatherUsageStats = false
