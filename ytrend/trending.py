@@ -48,6 +48,8 @@ def _video_row(v: dict, categories: dict[str, str]) -> dict:
         "views_per_hour": round(views / age_h),
         "engagement": round((likes + comments) / views, 4) if views else 0.0,
         "tags": sn.get("tags", [])[:15],
+        # Uploader's "altered or synthetic content" disclosure (None when not reported).
+        "synthetic_disclosure": v.get("status", {}).get("containsSyntheticMedia"),
         "thumbnail": _best_thumb(sn.get("thumbnails", {})),
         "url": f"https://www.youtube.com/watch?v={v['id']}",
     }

@@ -200,3 +200,30 @@ def test_frames(tmp_path):
     assert res["shots"] == 4, res["shot_timeline"]
     assert res["cuts_per_minute"] == 9.0  # 3 cuts in 20 s
     assert res["frames"] and all(Path(f["path"]).exists() for f in res["frames"])
+
+
+def test_ai_finder(monkeypatch):
+    from ytrend import ai_finder
+    monkeypatch.setitem(VIDEOS["v2"], "status", {"containsSyntheticMedia": True})
+    monkeypatch.setitem(VIDEOS["v3"]["snippet"], "tags", ["sora ai", "veo 3"])
+    found = ai_finder.discover(client(), ["ai story", "ai video"], "IN", "hi", days=3)
+    assert len(found) == 6 and all(r["queries"] == ["ai story", "ai video"] for r in found)
+    assert found[0]["views_per_hour"] >= found[-1]["views_per_hour"]
+    by_id = {r["video_id"]: r for r in found}
+    assert "uploader disclosed synthetic media" in by_id["v2"]["ai_signals"]
+    assert "sora" in by_id["v3"]["ai_reason"] and by_id["v3"]["ai_verdict"] == "likely_ai"
+    assert by_id["v4"]["ai_verdict"] == "unclear"
+
+    monkeypatch.setattr(ai, "detect_ai_videos", lambda vids, use_thumbnails=True: {
+        v["video_id"]: {"verdict": "ai_generated" if v["video_id"] in ("v1", "v2") else "not_ai",
+                        "confidence": 90, "niche": "AI Hindi horror story", "reason": "waxy faces"}
+        for v in vids})
+    ai_finder.verify_with_claude(found)
+    niches = ai_finder.summarize_niches(found)
+    assert [n["niche"] for n in niches] == ["AI Hindi horror story"] and niches[0]["videos"] == 2
+
+
+def test_ai_terms_do_not_match_plain_words():
+    from ytrend.ai_finder import metadata_signals
+    assert metadata_signals({"title": "Said the captain", "description": "", "tags": []}) == []
+    assert metadata_signals({"title": "Kling AI dragon", "description": "", "tags": []})

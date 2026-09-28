@@ -156,6 +156,77 @@ def refine_languages(videos: list[dict]) -> dict[str, str]:
     return out
 
 
+# ---------------------------------------------------------------- AI-generated video detection
+AI_VERDICTS = ["ai_generated", "likely_ai", "unclear", "not_ai"]
+
+_AIDETECT_SYSTEM = """You judge whether YouTube videos are AI-generated content: visuals made
+with image/video generators (Midjourney, Flux, Sora, Veo, Kling, Runway, Pika,
+Hailuo…), AI avatars, or AI-voiced slideshows of generated images. Real footage,
+game footage, film trailers, music videos, vlogs and hand-made animation are not_ai.
+
+You get each video's title, channel, tags, description snippet, the uploader's
+synthetic-media disclosure (true/false/null) and sometimes its thumbnail image.
+Thumbnail tells: waxy/plastic skin, over-smooth lighting, surreal or impossible
+scenes, warped hands/text, uniform "AI art" look across a channel.
+
+For each video return:
+- verdict: ai_generated (clear), likely_ai, unclear, not_ai
+- confidence: 0-100
+- niche: 2-6 words naming the AI content type, e.g. "AI animal rescue Shorts",
+  "AI Hindi moral stories", "AI historical POV", "AI baby dance", "AI horror story",
+  "AI kids cartoon songs". Use "not AI" when verdict is not_ai.
+- reason: one short sentence with the evidence."""
+
+_AIDETECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "videos": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "video_id": {"type": "string"},
+                    "verdict": {"type": "string", "enum": AI_VERDICTS},
+                    "confidence": {"type": "integer"},
+                    "niche": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["video_id", "verdict", "confidence", "niche", "reason"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["videos"],
+    "additionalProperties": False,
+}
+
+
+def detect_ai_videos(videos: list[dict], use_thumbnails: bool = True) -> dict[str, dict]:
+    """videos: [{video_id, title, channel, tags, description, synthetic_disclosure, thumbnail}]."""
+    out: dict[str, dict] = {}
+    size = 10 if use_thumbnails else 40
+    for batch in _batches(videos, size):
+        meta = [{k: v[k] for k in ("video_id", "title", "channel", "tags", "description",
+                                   "synthetic_disclosure")} for v in batch]
+        content: list[dict] = [{"type": "text", "text": "<videos>\n" + json.dumps(meta, ensure_ascii=False)
+                                + "\n</videos>"}]
+        if use_thumbnails:
+            for v in batch:
+                if v.get("thumbnail"):
+                    content.append({"type": "text", "text": f"Thumbnail of {v['video_id']}:"})
+                    content.append({"type": "image", "source": {"type": "url", "url": v["thumbnail"]}})
+        try:
+            data = json_call(_AIDETECT_SYSTEM, content, _AIDETECT_SCHEMA)
+        except Exception:
+            if not use_thumbnails:
+                raise
+            # A thumbnail URL that can't be fetched fails the whole request; retry on text only.
+            data = json_call(_AIDETECT_SYSTEM, content[:1], _AIDETECT_SCHEMA)
+        for r in data["videos"]:
+            out[r["video_id"]] = {k: r[k] for k in ("verdict", "confidence", "niche", "reason")}
+    return out
+
+
 # ---------------------------------------------------------------- 6. comments
 _COMMENTS_SYSTEM = """You read viewer comments from a YouTube channel's best videos and pull
 out what the audience wants. Quote or paraphrase briefly, keep each item short,

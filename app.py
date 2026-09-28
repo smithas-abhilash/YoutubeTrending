@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from ytrend import ai, storage
+from ytrend.ai_finder import AI_VERDICTS_SHOWN, KEYWORD_PACKS, discover, summarize_niches, verify_with_claude
 from ytrend.channel import analyze_channel, combine_analyses
 from ytrend.frames import analyze_video_file
 from ytrend.master_prompt import collect_images, generate_template, refine, start_conversation
@@ -39,6 +40,9 @@ REGIONS = {
     "France": "FR", "Germany": "DE", "Japan": "JP", "South Korea": "KR",
     "Russia": "RU", "Turkey": "TR", "Nigeria": "NG", "Kenya": "KE",
 }
+CATEGORIES = ["Music", "Film & Animation", "Gaming", "Entertainment", "People & Blogs", "Comedy",
+              "Sports", "News & Politics", "Education", "Science & Technology", "Howto & Style",
+              "Autos & Vehicles", "Pets & Animals", "Travel & Events", "Nonprofits & Activism"]
 LANG_CHOICES = sorted(v for k, v in LANGUAGE_NAMES.items() if k != "unknown")
 NAME_TO_CODE = {v: k for k, v in LANGUAGE_NAMES.items()}
 
@@ -86,7 +90,7 @@ def yt_client() -> YouTubeClient | None:
 def add_to_analysis(ref: str, name: str) -> None:
     if ref not in ss.to_analyse:
         ss.to_analyse.append(ref)
-    st.toast(f"Added {name} — open tab ③ to analyse.")
+    st.toast(f"Added {name} — open tab ④ to analyse.")
 
 
 def claude_error(e: Exception) -> None:
@@ -94,8 +98,9 @@ def claude_error(e: Exception) -> None:
 
 
 st.title("📈 YouTube Trending Analyzer")
-tab_tr, tab_br, tab_an, tab_mp, tab_hi = st.tabs(
-    ["① Trending by language", "② Breakout finder", "③ Analyse channels", "④ Master prompt", "⑤ History"]
+tab_tr, tab_ai, tab_br, tab_an, tab_mp, tab_hi = st.tabs(
+    ["① Trending by language", "② 🤖 AI video finder", "③ Breakout finder", "④ Analyse channels",
+     "⑤ Master prompt", "⑥ History"]
 )
 
 # ============================================================================= ① trending
@@ -113,6 +118,10 @@ with tab_tr:
                             help="Tells Hindi from Marathi and catches Hinglish written in English letters.")
     hide_big = o3.checkbox("Hide TV / film / music labels", value=False,
                            help="Needs style labels. Shows only channels a newcomer can realistically copy.")
+    f1, f2 = st.columns([3, 1])
+    excluded = f1.multiselect("Exclude categories", CATEGORIES, default=["Music", "Film & Animation", "Gaming"],
+                              help="The trending chart is dominated by trailers, music videos and big gamers.")
+    min_vph = f2.number_input("Min views/hour", 0, 10_000_000, 0, step=1000)
 
     if st.button("Find trending", type="primary", disabled=not regions):
         yt = yt_client()
@@ -138,7 +147,8 @@ with tab_tr:
     rows = ss.get("trending_rows")
     if rows:
         code = NAME_TO_CODE.get(lang_filter) if lang_filter != "All" else None
-        view = filter_language(rows, code)
+        view = [r for r in filter_language(rows, code)
+                if r["category"] not in excluded and r["views_per_hour"] >= min_vph]
         summary = summarize(view, exclude_big_media=hide_big)
         if not summary["total_videos"]:
             st.info("No trending videos matched this filter.")
@@ -225,7 +235,101 @@ with tab_tr:
             r1.markdown("**Rising** 📈\n\n" + ("\n".join(f"- {k}: +{d} pts" for k, d in rf["rising"]) or "—"))
             r2.markdown("**Fading** 📉\n\n" + ("\n".join(f"- {k}: {d} pts" for k, d in rf["fading"]) or "—"))
 
-# ============================================================================= ② breakouts
+# ============================================================================= ② AI video finder
+VERDICT_BADGE = {"ai_generated": "🤖 AI", "likely_ai": "🤖 likely AI", "unclear": "❔ unclear", "not_ai": "🎥 not AI"}
+
+with tab_ai:
+    st.markdown("Finds **AI-generated videos getting strong views per hour right now** by searching recent "
+                "uploads with AI-video keywords (they rarely reach YouTube's trending chart).")
+    packs = st.multiselect("Keyword packs", list(KEYWORD_PACKS),
+                           default=["General AI video", "AI stories (Hindi / Indian)", "AI Shorts: animals & babies"])
+    custom = st.text_input("Extra keywords (comma separated)", placeholder="e.g. ai bhakti, ai cricket, ai mahabharat")
+    queries = list(dict.fromkeys([q for p in packs for q in KEYWORD_PACKS[p]] +
+                                 [q.strip() for q in custom.split(",") if q.strip()]))
+    with st.expander(f"Search queries ({len(queries)})"):
+        st.write(", ".join(queries) or "—")
+
+    c1, c2, c3, c4 = st.columns(4)
+    a_region = c1.selectbox("Region", ["Any"] + list(REGIONS), index=1 + list(REGIONS).index("India"), key="a_region")
+    a_lang = c2.selectbox("Language", ["Any"] + LANG_CHOICES, key="a_lang")
+    a_days = c3.slider("Uploaded in the last N days", 1, 14, 3, key="a_days")
+    a_fmt = c4.selectbox("Format", ["Any", "Shorts (< 4 min)", "Medium (4-20 min)", "Long (> 20 min)"])
+    c5, c6, c7 = st.columns(3)
+    a_min_vph = c5.number_input("Min views/hour", 0, 10_000_000, 500, step=500)
+    a_max_subs = c6.select_slider("Max channel subscribers", ["No limit", 10_000, 50_000, 100_000, 500_000, 1_000_000],
+                                  value="No limit", format_func=lambda n: n if isinstance(n, str) else f"{n:,}")
+    a_pages = c7.number_input("Pages per query (50 videos each)", 1, 3, 1)
+    v1, v2 = st.columns(2)
+    a_verify = v1.checkbox("Verify with Claude (looks at thumbnails)", value=ai.available(), disabled=not ai.available(),
+                           help="Without Claude, videos are judged only by YouTube's AI disclosure and AI words in the metadata.")
+    a_thumbs = v2.checkbox("Include thumbnails in the check", value=True, disabled=not a_verify)
+    cost = len(queries) * int(a_pages) * 100
+    st.caption(f"Estimated YouTube quota: up to {cost:,} units (cached for 6 h; you have "
+               f"{max(DAILY_QUOTA - storage.quota_used_today(), 0):,} left today).")
+
+    if st.button("Find AI videos", type="primary", disabled=not queries):
+        yt = yt_client()
+        if yt:
+            try:
+                prog = st.progress(0.0, text="Searching…")
+                dur = {"Shorts (< 4 min)": "short", "Medium (4-20 min)": "medium", "Long (> 20 min)": "long"}.get(a_fmt)
+                found = discover(yt, queries, None if a_region == "Any" else REGIONS[a_region],
+                                 NAME_TO_CODE.get(a_lang) if a_lang != "Any" else None, days=a_days, duration=dur,
+                                 pages=int(a_pages), max_subscribers=None if a_max_subs == "No limit" else a_max_subs,
+                                 progress=lambda f: prog.progress(f, text="Searching…"))
+                found = [r for r in found if r["views_per_hour"] >= a_min_vph]
+                if found and a_verify:
+                    with st.spinner(f"Claude is checking {min(len(found), 120)} videos for AI content…"):
+                        verify_with_claude(found, use_thumbnails=a_thumbs)
+                ss.ai_found = found
+                storage.history_save("ai_finder", f"AI finder {a_region}/{a_lang}/{a_days}d — {len(found)} videos", found)
+            except YouTubeError as e:
+                st.error(str(e))
+            except Exception as e:
+                claude_error(e)
+
+    found = ss.get("ai_found")
+    if found is not None:
+        show_all = st.toggle("Also show videos judged not AI / unclear", value=False)
+        shown = found if show_all else [r for r in found if r["ai_verdict"] in AI_VERDICTS_SHOWN]
+        n_ai = sum(r["ai_verdict"] in AI_VERDICTS_SHOWN for r in found)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Videos found", len(found))
+        m2.metric("AI-generated", n_ai)
+        m3.metric("Median VPH (AI)", f"{int(pd.Series([r['views_per_hour'] for r in found if r['ai_verdict'] in AI_VERDICTS_SHOWN]).median() or 0):,}"
+                  if n_ai else "—")
+
+        niches = summarize_niches(found)
+        if niches:
+            st.subheader("AI niches ranked by median views/hour")
+            ndf = pd.DataFrame(niches)
+            st.dataframe(ndf, width="stretch", hide_index=True,
+                         column_config={"best_url": st.column_config.LinkColumn("best video link"),
+                                        "median_vph": st.column_config.NumberColumn("median VPH", format="%d"),
+                                        "best_vph": st.column_config.NumberColumn("best VPH", format="%d"),
+                                        "shorts_pct": st.column_config.NumberColumn("% Shorts", format="%d%%")})
+            ss.trending_lang = {"source": "AI video finder", "language_name": a_lang,
+                                "ai_niches_by_vph": niches[:12]}
+            st.caption("This niche table is passed to the master prompt as trending context.")
+
+        st.subheader(f"Videos ({len(shown)})")
+        for r in shown[:60]:
+            a, b, c = st.columns([1, 4, 1])
+            if r["thumbnail"]:
+                a.image(r["thumbnail"])
+            subs = f"{r['subscribers']:,} subs" if r.get("subscribers") is not None else "subs hidden"
+            b.markdown(
+                f"**[{r['title']}]({r['url']})**  \n{r['channel']} · {subs} · "
+                f"**{r['views_per_hour']:,} views/h** · {r['views']:,} views · "
+                f"{r['format']} {fmt_seconds(r['duration_s'])} · {language_name(r['language'])}  \n"
+                f"{VERDICT_BADGE[r['ai_verdict']]} ({r['ai_confidence']}%)"
+                + (f" · _{r['ai_niche']}_" if r.get("ai_niche") else "")
+                + f" — {r['ai_reason']}"
+            )
+            if c.button("Add →", key=f"ai_{r['video_id']}"):
+                add_to_analysis(r["channel_id"], r["channel"])
+
+# ============================================================================= ③ breakouts
 with tab_br:
     st.markdown("Recent videos from **small channels** that got far more views than their size — "
                 "the formats a newcomer can realistically copy.")
@@ -280,7 +384,7 @@ with tab_br:
                 if c.button("Add →", key=f"br_{r['video_id']}"):
                     add_to_analysis(r["channel_id"], r["channel"])
 
-# ============================================================================= ③ analyse
+# ============================================================================= ④ analyse
 with tab_an:
     refs_text = st.text_area(
         "Channels to analyse — one per line. Two or more are blended into one shared formula.",
@@ -396,13 +500,13 @@ with tab_an:
         st.download_button("Download analysis (JSON)",
                            json.dumps(an, ensure_ascii=False, indent=2, default=str),
                            file_name=f"analysis_{ch['id']}.json")
-        st.info("Next: open tab ④ to add screenshots, a reference video and your brief.")
+        st.info("Next: open tab ⑤ to add screenshots, a reference video and your brief.")
 
-# ============================================================================= ④ master prompt
+# ============================================================================= ⑤ master prompt
 with tab_mp:
     an = ss.get("analysis")
     if not an:
-        st.info("Analyse a channel in tab ③ first, load one from ⑤ History, or upload a saved analysis JSON.")
+        st.info("Analyse a channel in tab ④ first, load one from ⑥ History, or upload a saved analysis JSON.")
         up = st.file_uploader("Saved analysis JSON", type=["json"])
         if up:
             ss.analysis = json.load(up)
@@ -531,9 +635,10 @@ with tab_mp:
                 if n_edits:
                     st.caption(f"{n_edits} refinement(s) applied — the document above is the latest version.")
 
-# ============================================================================= ⑤ history
+# ============================================================================= ⑥ history
 with tab_hi:
-    kind_label = {"analysis": "Channel analyses", "prompt": "Master prompts", "breakouts": "Breakout searches"}
+    kind_label = {"analysis": "Channel analyses", "prompt": "Master prompts", "ai_finder": "AI finder searches",
+                  "breakouts": "Breakout searches"}
     kind = st.radio("Show", list(kind_label), format_func=kind_label.get, horizontal=True)
     items = storage.history_list(kind)
     if not items:
@@ -550,17 +655,23 @@ with tab_hi:
                 ss.analysis = body
                 ss.pop("conversation", None)
                 ss.pop("master", None)
-                st.success("Loaded — see tabs ③ and ④.")
+                st.success("Loaded — see tabs ④ and ⑤.")
             st.json(body, expanded=False)
         elif kind == "prompt":
             if h1.button("Load", type="primary"):
                 ss.master = body["markdown"]
                 ss.pop("conversation", None)
-                st.success("Loaded into tab ④ (refinement needs a fresh generation).")
+                st.success("Loaded into tab ⑤ (refinement needs a fresh generation).")
             st.markdown(body["markdown"])
+        elif kind == "ai_finder":
+            if h1.button("Load", type="primary"):
+                ss.ai_found = body
+                st.success("Loaded into tab ②.")
+            st.dataframe(pd.DataFrame(body)[["title", "channel", "views_per_hour", "ai_verdict", "ai_niche", "url"]]
+                         if body else pd.DataFrame(), width="stretch")
         else:
             if h1.button("Load", type="primary"):
                 ss.breakouts = body
-                st.success("Loaded into tab ②.")
+                st.success("Loaded into tab ③.")
             st.dataframe(pd.DataFrame(body)[["title", "channel", "subscribers", "views", "breakout_ratio", "url"]]
                          if body else pd.DataFrame(), width="stretch")

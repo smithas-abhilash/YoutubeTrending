@@ -87,7 +87,7 @@ class YouTubeClient:
             self._paged(
                 "videos",
                 limit,
-                part="snippet,contentDetails,statistics",
+                part="snippet,contentDetails,statistics,status",
                 chart="mostPopular",
                 regionCode=region,
                 videoCategoryId=category_id,
@@ -104,7 +104,7 @@ class YouTubeClient:
         for i in range(0, len(ids), 50):
             data = self._get(
                 "videos",
-                part="snippet,contentDetails,statistics",
+                part="snippet,contentDetails,statistics,status",
                 id=",".join(ids[i : i + 50]),
             )
             out.extend(data.get("items", []))
@@ -178,6 +178,7 @@ class YouTubeClient:
         published_after: str | None = None,
         order: str = "viewCount",
         limit: int = 50,
+        duration: str | None = None,
     ) -> list[dict]:
         """Search videos (costs 100 quota units per page — use sparingly)."""
         ids = [
@@ -192,6 +193,7 @@ class YouTubeClient:
                 relevanceLanguage=language,
                 publishedAfter=published_after,
                 order=order,
+                videoDuration=duration,  # "short" (<4 min), "medium" (4-20), "long" (>20)
             )
         ]
         return self.videos(ids)
